@@ -20,32 +20,34 @@ output_dir = 'cvrp-AM-model'
 save_dir = os.path.join(os.getcwd(), output_dir)
 
 embedding_size = 128
-city_size = 21
-batch = 512
-times = 2500
-epochs = 100
-test2save_times = 20
-min = 100
-l = 30  # 初始容量
-M = 8
-dk = embedding_size / M
-C = 10
-bl_alpha = 0.05
-mask_size = t.LongTensor(batch).to(DEVICE)
+city_size = 21  # 节点总数
+batch = 512  # 每个batch的算例数
+times = 2500  # 训练中每个epoch所需的训练batch数
+epochs = 100  # 训练的epoch总数
+test2save_times = 20  # 训练过程中每次保存模型所需的测试batch数
+min = 100  # 当前已保存的所有模型中测试路径长度的最小值
+l = 30  # 车辆的初始容量
+M = 8  # 多头注意力中的头数
+dk = embedding_size / M  # 多头注意力中每一头的维度
+C = 10  # 做softmax得到选取每个点概率前，clip the result所使用的参数
+bl_alpha = 0.05  # 做t-检验更新baseline时所设置的阈值
+mask_size = t.LongTensor(batch).to(DEVICE)  # 用于标号，方便后面两点间的距离计算
 for i in range(batch):
     mask_size[i] = city_size * i
 
 is_train = False  # 是否训练
-# test
-test_times = 100
-test_is_sample = False  # 测试时是否使用采样法
+
+# 测试
+test_times = 100  # 测试时所需的batch总数
+test_is_sample = False  # 测试时是否要使用sampling方法，否则使用greedy方法
 
 
 class act_net(nn.Module):
     def __init__(self):
         super().__init__()
-        self.embedding = nn.Linear(3, embedding_size)
-        self.embedding_p = nn.Linear(2, embedding_size)
+        self.embedding = nn.Linear(3, embedding_size)  # 用于客户点的坐标加容量需求的embedding
+        self.embedding_p = nn.Linear(2, embedding_size)  # 用于仓库点的坐标embedding
+
         self.wq1 = nn.Linear(embedding_size, embedding_size)
         self.wk1 = nn.Linear(embedding_size, embedding_size)
         self.wv1 = nn.Linear(embedding_size, embedding_size)
@@ -55,7 +57,9 @@ class act_net(nn.Module):
         self.wq2 = nn.Linear(embedding_size, embedding_size)
         self.wk2 = nn.Linear(embedding_size, embedding_size)
         self.wv2 = nn.Linear(embedding_size, embedding_size)
+
         self.w2 = nn.Linear(embedding_size, embedding_size)
+
         self.wq3 = nn.Linear(embedding_size, embedding_size)
         self.wk3 = nn.Linear(embedding_size, embedding_size)
         self.wv3 = nn.Linear(embedding_size, embedding_size)
@@ -78,6 +82,7 @@ class act_net(nn.Module):
         self.fw3 = nn.Linear(embedding_size, embedding_size * 4)
         self.fb3 = nn.Linear(embedding_size * 4, embedding_size)
 
+        # Batch Normalization(BN)
         self.BN11 = nn.BatchNorm1d(embedding_size)
         self.BN12 = nn.BatchNorm1d(embedding_size)
         self.BN21 = nn.BatchNorm1d(embedding_size)
@@ -85,24 +90,18 @@ class act_net(nn.Module):
         self.BN31 = nn.BatchNorm1d(embedding_size)
         self.BN32 = nn.BatchNorm1d(embedding_size)
 
-    def forward(self, s, d, l, train):  # 坐标，需求，初始容量
-        # if train == 2:
-        #     for i in self.parameters():
-        #         i.requires_grad = True
-        # else:
-        #     for i in self.parameters():
-        #         i.requires_grad = False
+    def forward(self, s, d, l, train):  # s坐标，d需求，l初始容量, train==0表示无需计算梯度且使用greedy方法，train>0表示需要计算梯度且使用sampling方法
         # s :[batch x seq_len x 2]
         s1 = t.unsqueeze(s, dim=1)
         s1 = s1.expand(batch, city_size, city_size, 2)
         s2 = t.unsqueeze(s, dim=2)
         s2 = s2.expand(batch, city_size, city_size, 2)
         ss = s1 - s2
-        dis = t.norm(ss, 2, dim=3, keepdim=True)  # 任意两点间的距离 (batch, city_size, city_size, 1)
+        dis = t.norm(ss, 2, dim=3, keepdim=True)  # dis表示任意两点间的距离 (batch, city_size, city_size, 1)
 
-        pro = t.FloatTensor(batch, city_size * 2).to(DEVICE)
-        seq = t.LongTensor(batch, city_size * 2).to(DEVICE)
-        index = t.LongTensor(batch).to(DEVICE)
+        pro = t.FloatTensor(batch, city_size * 2).to(DEVICE)  # 每个点被选取时的选取概率,将其连乘可得到选取整个路径的概率
+        seq = t.LongTensor(batch, city_size * 2).to(DEVICE)  # 选取的序列
+        index = t.LongTensor(batch).to(DEVICE)  # 当前车辆所在的点
         tag = t.ones(batch * city_size).to(DEVICE)
         distance = t.zeros(batch).to(DEVICE)  # 总距离
         rest = t.LongTensor(batch, 1, 1).to(DEVICE)  # 车的剩余容量
@@ -110,12 +109,17 @@ class act_net(nn.Module):
         rest[:, 0, 0] = l
         dd[:, :] = d[:, :, 0]  # 需求
         index[:] = 0
-        sss = t.cat([s, d.float()], dim=2)  # [batch x seq_len x 3]
-        node = self.embedding(sss)
-        node[:, 0, :] = self.embedding_p(s[:, 0, :])  # 仓库只embedding坐标
+        sss = t.cat([s, d.float()], dim=2)  # [batch x seq_len x 3] 坐标与容量需求拼接
+
+        # node为所有点的的初始embedding
+        node = self.embedding(sss)  # 客户点embedding坐标加容量需求
+        node[:, 0, :] = self.embedding_p(s[:, 0, :])  # 仓库点只embedding坐标
         x111 = node  # [batch x seq_len x embedding_dim]
 
-        # MHA
+        ##################################################################################
+        # encoder部分
+        #####################################################
+        # 第一层MHA
         query1 = self.wq1(node)
         query1 = t.unsqueeze(query1, dim=2)
         query1 = query1.expand(batch, city_size, city_size, embedding_size)
@@ -140,25 +144,26 @@ class act_net(nn.Module):
 
         x = x + x111
         #####################
-        # BN
+        # 第一层第一个BN
         x = x.permute(0, 2, 1)
         x = self.BN11(x)
         x = x.permute(0, 2, 1)
         # x = t.tanh(x)
-        ####################
-        # FF
+        #####################
+        # 第一层FF
         x1 = self.fw1(x)
         x1 = F.relu(x1)
-        x1 = self.fb1(x1)  # FF
+        x1 = self.fb1(x1)
+
         x = x + x1
-        # BN
+        #####################
+        # 第一层第二个BN
         x = x.permute(0, 2, 1)
         x = self.BN12(x)
         x = x.permute(0, 2, 1)
-        # x = t.tanh(x)
         x1 = x  # h_i^(l) n=1
-
-        # MHA
+        #####################################################
+        # 第二层MHA
         query2 = self.wq2(x)
         query2 = t.unsqueeze(query2, dim=2)
         query2 = query2.expand(batch, city_size, city_size, embedding_size)
@@ -182,24 +187,27 @@ class act_net(nn.Module):
         x = self.w2(x)
 
         x = x + x1
-
+        #####################
+        # 第二层第一个BN
         x = x.permute(0, 2, 1)
         x = self.BN21(x)
         x = x.permute(0, 2, 1)
-        # x = t.tanh(x)
 
-        # FF
+        #####################
+        # 第二层FF
         x1 = self.fw2(x)
         x1 = F.relu(x1)
         x1 = self.fb2(x1)
         x = x + x1
-
+        #####################
+        # 第二层第二个BN
         x = x.permute(0, 2, 1)
         x = self.BN22(x)
         x = x.permute(0, 2, 1)
-        # x = t.tanh(x)
-        x1 = x  # h_i^(l) n=2
 
+        x1 = x  # h_i^(l) n=2
+        #####################################################
+        # 第三层MHA
         query3 = self.wq3(x)
         query3 = t.unsqueeze(query3, dim=2)
         query3 = query3.expand(batch, city_size, city_size, embedding_size)
@@ -223,26 +231,28 @@ class act_net(nn.Module):
         x = self.w3(x)
 
         x = x + x1
-
+        #####################
+        # 第三层第一个BN
         x = x.permute(0, 2, 1)
         x = self.BN31(x)
         x = x.permute(0, 2, 1)
-        # x = t.tanh(x)
+        #####################
+        # 第三层FF
         x1 = self.fw3(x)
         x1 = F.relu(x1)
         x1 = self.fb3(x1)
         x = x + x1
-
+        #####################
+        # 第三层第二个BN
         x = x.permute(0, 2, 1)
         x = self.BN32(x)
-        x = x.permute(0, 2, 1)
-        # x = t.tanh(x) #h_i^(l) n=3 (batch, city_size, embedding_size)
+        x = x.permute(0, 2, 1)  # h_i^(l) n=3 (batch, city_size, embedding_size)
         x = x.contiguous()
-        avg = t.mean(x, dim=1)  # 每个batch所有点的context信息embedding，(batch, embedding_size)
+        avg = t.mean(x, dim=1)  # 最后将所有节点的嵌入信息取平均得到整个图的嵌入信息，(batch, embedding_size)
 
         ##################################################################################
-        # decoder
-        for i in range(city_size * 2):
+        # decoder部分
+        for i in range(city_size * 2):  # decoder输出序列的长度不超过city_size * 2
             flag = t.sum(dd, dim=1)  # dd:(batch, city_size)
             f1 = t.nonzero(flag > 0).view(-1)  # 取得需求不全为0的batch号
             f2 = t.nonzero(flag == 0).view(-1)  # 取得需求全为0的batch号
@@ -305,13 +315,13 @@ class act_net(nn.Module):
 
             mask = mask[:, :, 0]
             temp.masked_fill_(mask, -float('inf'))
-            p = F.softmax(temp, dim=1)
+            p = F.softmax(temp, dim=1)  # 得到选取每个点时所有点可能被选择的概率
 
             indexx = t.LongTensor(batch).to(DEVICE)
             if train != 0:
-                indexx[f1] = t.multinomial(p[f1], 1)[:, 0]
+                indexx[f1] = t.multinomial(p[f1], 1)[:, 0]  # 按sampling策略选点
             else:
-                indexx[f1] = (t.max(p[f1], dim=1)[1])
+                indexx[f1] = (t.max(p[f1], dim=1)[1])  # 按greedy策略选点
 
             indexx[f2] = 0
             p = p.view(-1)
@@ -336,20 +346,18 @@ class act_net(nn.Module):
             seq = seq.detach()
             pro = pro.detach()
             distance = distance.detach()
-        return seq, pro, distance
+
+        return seq, pro, distance  # 被选取的点序列,每个点被选取时的选取概率,这些序列的总路径长度
 
 
 net1 = act_net()
-# if t.cuda.device_count() > 1:
-#     net1 = nn.DataParallel(net1)
 net1 = net1.to(DEVICE)
 net1.load_state_dict(t.load('cvrp-AM-model/AM_VRP20.pt'))
 net2 = act_net()
-# if t.cuda.device_count() > 1:
-#     net2 = nn.DataParallel(net2)
 net2 = net2.to(DEVICE)
 net2.load_state_dict(net1.state_dict())
 
+# 训练部分
 if is_train is True:
     opt = optim.Adam(net1.parameters(), 0.0001)
 
@@ -377,14 +385,14 @@ if is_train is True:
             t2 = time.time()
             # print('nn_output_time={}'.format(t2 - t1))
             ###################################################################
-            # reward
+            # 带baseline的策略梯度训练算法,dis2作为baseline
             pro = t.log(pro1)
             loss = t.sum(pro, dim=1)
-            score = dis1 - dis2
+            score = dis1 - dis2  # advantage reward(优势函数)
 
             score = score.detach()
             loss = score * loss
-            loss = t.sum(loss) / batch
+            loss = t.sum(loss) / batch  # 最终损失函数
 
             opt.zero_grad()
             loss.backward()
@@ -394,6 +402,7 @@ if is_train is True:
             print('epoch={},i={},mean_dis1={},mean_dis2={}'.format(epoch, i, t.mean(dis1), t.mean(
                 dis2)))  # ,'disloss:',t.mean((dis1-dis2)*(dis1-dis2)), t.mean(t.abs(dis1-dis2)), nan)
 
+            # OneSidedPairedTTest(做t-检验看当前Sampling的解效果是否显著好于greedy的解效果,如果是则更新使用greedy策略作为baseline的net2参数)
             if (dis1.mean() - dis2.mean()) < 0:
                 tt, pp = ttest_rel(dis1.cpu().numpy(), dis2.cpu().numpy())
                 p_val = pp / 2
@@ -402,6 +411,7 @@ if is_train is True:
                     print('Update baseline')
                     net2.load_state_dict(net1.state_dict())
 
+            # 每隔xxx步做测试判断结果有没有改进，如果改进了则把当前模型保存下来
             if (i + 1) % 100 == 0:
                 length = t.zeros(1).to(DEVICE)
                 for j in range(test2save_times):
@@ -419,7 +429,9 @@ if is_train is True:
                                                                epoch, i, length.item())))
                     min = length
                 print('min=', min.item(), 'length=', length.item())
+# 测试部分
 else:
+    # 按照greedy策略测试
     if test_is_sample is False:
         tS = t.rand(batch * test_times, city_size, 2)  # 坐标0~1之间
         tD = np.random.randint(1, 10, size=(batch * test_times, city_size, 1))  # 所有客户的需求
@@ -445,6 +457,8 @@ else:
         mean_dis = sum_dis / test_times
         mean_clock = sum_clock / test_times
         print("mean_dis:{},mean_clock:{}".format(mean_dis, mean_clock))
+
+    # 按照sampling策略测试
     else:
         tS = t.rand(test_times, city_size, 2)  # 坐标0~1之间
         tD = np.random.randint(1, 10, size=(test_times, city_size, 1))  # 所有客户的需求
